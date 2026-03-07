@@ -7,6 +7,8 @@
 #include <sys/sem.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <errno.h>
+#include <stdbool.h>
 
 #define SOCK_KTP 101
 #define BUF_SIZE 10
@@ -16,21 +18,29 @@
 #define T 5
 #define P 0.3
 
-const int SEM_KEY = ftok(".", 'S');
-const int SHM_KEY = ftok(".", 'J');
+#define ENOSPACE ENOSPC
+#define ENOTBOUND ENOTCONN
+#define ENOMESSAGE ENOMSG
+
+int semid;
+int shmid;
 
 typedef struct {
     int start;
     int end;
-    char messages[BUF_SIZE][MSG_SIZE];
+    int seq_num[BUF_SIZE]; // sequence number for each slot in the window
+    // expected sequence number for the next message to be added to each slot in the window for rwnd
+    // contains the sequence numbers of the messages sent, but not yet acknowledged for swnd
+    int last_ack; // sequence number of the last acknowledged message for swnd
+    int last_seq; // sequence number of the last sent message for swnd
 } window;
 
 typedef struct {
-    int sockfd; // corresponding UDP socket file descriptor
+    int udpsockfd; // corresponding UDP socket file descriptor
     int pid;
-    int isfree = 1;
+    bool isfree; // 1 if this entry is free, 0 otherwise
     // sockaddr_in src;
-    sockaddr_in dest;
+    struct sockaddr_in dest;
     char send_buf[BUF_SIZE][MSG_SIZE];
     char recv_buf[BUF_SIZE][MSG_SIZE];
     window swnd; // sender window
@@ -45,6 +55,16 @@ int k_bind(int sockfd, struct sockaddr* src, struct sockaddr* dest);
 
 ssize_t k_sendto(int sockfd, const void* buf, size_t len, int flags, const struct sockaddr* dest_addr, socklen_t addrlen);
 
-ssize_t k_recvfrom(int sockfd, const void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t *addrlen);
+ssize_t k_recvfrom(int sockfd, void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t *addrlen);
 
 int close(int fd);
+
+bool dropMessage(float p);
+
+static inline void _sem_op(int semid, int idx, int op) {
+    struct sembuf sb = {(unsigned short)idx, (short)op, 0};
+    semop(semid, &sb, 1);
+}
+
+#define Wait(semid, idx) _sem_op((semid), (idx), -1)
+#define Signal(semid, idx) _sem_op((semid), (idx), +1)
