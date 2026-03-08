@@ -12,8 +12,8 @@
 #include <stdint.h>
 
 #define SOCK_KTP 101
-#define BUF_SIZE 10
-#define WINDOW_SIZE 10
+#define BUF_SIZE 11
+#define WINDOW_SIZE 11
 #define MSG_SIZE 512
 #define MSG_TYPE 4
 #define SEQ_NUM_MOD 256

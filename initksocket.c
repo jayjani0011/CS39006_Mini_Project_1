@@ -189,7 +189,14 @@ void *threadR() {
                     // compute offset from expected seq (wrap safe)
                     uint8_t diff = (uint8_t)(seq - expected);
                     // if packet outside receiver window -> drop
-                    if (diff >= BUF_SIZE) {
+                    // need to send duplicate ACK for duplicate packet
+                    if (seq == SM[i].last_ack_sent) {
+                        printf("Duplicate packet with seq %d received, expected %d. Resending ACK for last acknowledged seq %d\n", seq, expected, SM[i].last_ack_sent);
+                        char packet[KTP_HEADER_SIZE];
+                        build_packet(packet, "ACK\0", seq, SM[i].rwnd.size, NULL);
+                        sendto(SM[i].udpsockfd, packet, KTP_HEADER_SIZE, 0, (struct sockaddr *)&SM[i].dest, sizeof(SM[i].dest));
+                    }
+                    else if (diff >= BUF_SIZE) {
                         printf("Packet with seq %d outside receiver window, expected %d\n", seq, expected);
                         Signal(semid, i);
                         continue;
