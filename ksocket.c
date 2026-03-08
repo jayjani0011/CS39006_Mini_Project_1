@@ -71,13 +71,12 @@ ssize_t k_sendto(int sockfd, const void* buf, size_t len, int flags, const struc
         return -1;
     }
 
-    if (SM[sockfd].swnd.size == 0 || (SM[sockfd].swnd.end + 1) % BUF_SIZE == SM[sockfd].swnd.start) {
+    if ((SM[sockfd].swnd.end + 1) % BUF_SIZE == SM[sockfd].swnd.start) {
         printf("k_sendto: Socket %d sender window full, cannot send new packet\n", sockfd);
         errno = ENOSPACE;
         Signal(semid, sockfd);
         return -1;
     }
-    SM[sockfd].swnd.size--;   // reserve space in sender window
 
     int idx = SM[sockfd].swnd.end;
     strncpy(SM[sockfd].send_buf[idx], (char*)buf, len);

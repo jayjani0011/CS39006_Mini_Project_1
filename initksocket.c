@@ -143,6 +143,8 @@ void *threadR() {
                 char msg[MSG_SIZE];
                 parse_packet(packet, type, &seq, &rwnd, msg);
 
+                printf("Packet received on k_socket %d: type = %s, seq = %d, rwnd = %d\n", i, type, seq, rwnd);
+
                 // simulate unreliable channel
                 if (dropMessage(P)) {
                     printf("Packet dropped: type = %s, seq = %d, rwnd = %d\n", type, seq, rwnd);
@@ -159,7 +161,7 @@ void *threadR() {
                 // ACK RECEIVED
                 if (strcmp(type, "ACK") == 0) {
                     // update sender window size
-                    if (SM[i].swnd.size > rwnd) SM[i].swnd.size = rwnd;
+                    SM[i].swnd.size = rwnd;
                     // slide sender window only if this ACK advances it
                     if ((uint8_t)(seq - SM[i].swnd.last_ack) < SEQ_NUM_MOD / 2) {
                         slide_sender_window(i, seq);
@@ -224,7 +226,8 @@ void *threadS() {
 
     while (1) {
         // sleep for T / 2 seconds
-        usleep((T * 1000000) / 2);
+        sleep(T / 2);
+        printf("Sender thread awake, checking for timeouts and new packets to send\n");
         for (int i = 0; i < N; i++) {
             Wait(semid, i);
             if (SM[i].isfree || !SM[i].isbound) {
@@ -252,14 +255,12 @@ void *threadS() {
 
             // Step 2: Send new packets
             // update swnd size based on unacknowledged packets
-            while (window_count(W)) {
-                int idx = W->start;
-                // nothing pending to send
+            for (int idx = W->start; idx != W->end && W->size > 0; idx = (idx + 1) % BUF_SIZE, W->size--) {
                 if (SM[i].send_buf[idx][0] == '\0') {
                     break;
                 }
+                printf("Sending new packet with seq %d from buffer index %d for k_socket %d\n", W->last_seq + 1, idx, i);
                 send_new_packet(i, idx);
-                W->start = (W->start + 1) % BUF_SIZE;
             }
 
             Signal(semid, i);

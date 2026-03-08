@@ -68,7 +68,7 @@ int main(int argc, char *argv[]) {
             int err = errno;
             if (ret >= 0) break;
             printf("k_sendto error: %d\n", err);
-            if (err != ENOSPACE && err != ENOTBOUND) {
+            if (err != ENOSPACE && err != ENOTBOUND && err != EINVAL) {
                 perror("k_sendto");
                 exit(1);
             }

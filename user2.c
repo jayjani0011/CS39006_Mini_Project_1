@@ -57,7 +57,7 @@ int main(int argc, char *argv[]) {
     while (1) {
         ssize_t r = k_recvfrom(sockfd, buffer, MSG_SIZE, 0, NULL, NULL);
         if (r < 0) {
-            if (errno == ENOMESSAGE) {
+            if (errno == ENOMESSAGE || errno == EINVAL) {
                 sleep(1); // wait and retry if no message to receive
                 continue;
             }
