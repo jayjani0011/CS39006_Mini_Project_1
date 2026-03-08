@@ -2,59 +2,217 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <string.h>
 #include <time.h>
 #include <sys/select.h>
 
+// HEADER : 6 bytes
+//  4 bytes : "DATA" or "ACK\0"
+//  1 byte : SEQ NUM
+//  1 byte : RWND SIZE
+
+void build_packet(char *packet, const char *type, uint8_t seq, uint8_t rwnd, const char *msg) {
+    memcpy(packet, type, MSG_TYPE);
+    memcpy(packet + MSG_TYPE, &seq, sizeof(uint8_t));
+    memcpy(packet + MSG_TYPE + sizeof(uint8_t), &rwnd, sizeof(uint8_t));
+    if (msg != NULL) memcpy(packet + KTP_HEADER_SIZE, msg, MSG_SIZE);
+}
+
+void parse_packet(const char *packet, char *type, uint8_t *seq, uint8_t *rwnd, char *msg) {
+    memcpy(type, packet, MSG_TYPE);
+    type[MSG_TYPE] = '\0';
+    memcpy(seq, packet + MSG_TYPE, sizeof(uint8_t));
+    memcpy(rwnd, packet + MSG_TYPE + sizeof(uint8_t), sizeof(uint8_t));
+    if (msg != NULL) memcpy(msg, packet + KTP_HEADER_SIZE, MSG_SIZE);
+}
+
+int window_count(window *W) {
+    return (W->end - W->start + BUF_SIZE) % BUF_SIZE;
+}
+
+void send_ack(int sockindex, uint8_t seq) {
+    char packet[KTP_HEADER_SIZE];
+    build_packet(packet, "ACK\0", seq, SM[sockindex].rwnd.size, NULL);
+    sendto(SM[sockindex].udpsockfd, packet, KTP_HEADER_SIZE, 0, (struct sockaddr *)&SM[sockindex].dest, sizeof(SM[sockindex].dest));
+}
+
+void retransmit_packet(int sockindex, int bufindex) {
+    char packet[KTP_HEADER_SIZE + MSG_SIZE];
+    uint8_t seq = SM[sockindex].swnd.seq_num[bufindex];
+    build_packet(packet, "DATA", seq, SM[sockindex].rwnd.size, SM[sockindex].send_buf[bufindex]);
+    sendto(SM[sockindex].udpsockfd, packet, sizeof(packet), 0, (struct sockaddr *)&SM[sockindex].dest, sizeof(SM[sockindex].dest));
+    SM[sockindex].swnd.timestamp[bufindex] = time(NULL);
+}
+
+void send_new_packet(int sockindex, int bufindex) {
+    char packet[KTP_HEADER_SIZE + MSG_SIZE];
+    uint8_t seq = ++SM[sockindex].swnd.last_seq;
+    SM[sockindex].swnd.seq_num[bufindex] = seq;
+    build_packet(packet, "DATA", seq, SM[sockindex].rwnd.size, SM[sockindex].send_buf[bufindex]);
+    sendto(SM[sockindex].udpsockfd, packet, sizeof(packet), 0, (struct sockaddr *)&SM[sockindex].dest, sizeof(SM[sockindex].dest));
+    SM[sockindex].swnd.timestamp[bufindex] = time(NULL);
+}
+
+void slide_sender_window(int sockindex, uint8_t ack_seq) {
+    window *W = &SM[sockindex].swnd;
+    while (W->start != W->end && W->seq_num[W->start] != (ack_seq + 1) % SEQ_NUM_MOD) {
+        int idx = W->start;
+        memset(SM[sockindex].send_buf[idx], 0, MSG_SIZE);
+        W->start = (W->start + 1) % BUF_SIZE;
+        W->last_ack = ack_seq;
+    }
+}
+
 void *threadR() {
-    // receive messages from the UDP socket and add them to the receiver window of the corresponding socket in SM
-    // need to use select() to check for incoming messages on all UDP sockets in SM
-    fd_set readfds, masterfds;
+    fd_set readfds;
     struct timeval timeout;
+    printf("Receiver thread started\n");
 
     while (1) {
+        // Build fd set
         FD_ZERO(&readfds);
         int maxfd = -1;
         for (int i = 0; i < N; i++) {
             Wait(semid, i);
-            if (!SM[i].isfree) {
+            if (!SM[i].isfree && SM[i].isbound) {
+                if (SM[i].udpsockfd == -1) {
+                    SM[i].udpsockfd = socket(AF_INET, SOCK_DGRAM, 0);
+                    printf("Created UDP socket fd %d for k_sockfd %d\n", SM[i].udpsockfd, i);
+                    if (SM[i].udpsockfd < 0) {
+                        perror("socket");
+                        Signal(semid, i);
+                        continue;
+                    }
+                    if (bind(SM[i].udpsockfd, (struct sockaddr *)&SM[i].src, sizeof(SM[i].src)) < 0) {
+                        perror("bind");
+                        Signal(semid, i);
+                        continue;
+                    } // bind to source address
+                    printf("Bound UDP socket fd %d for k_sockfd %d to Source IP : %s, PORT : %d\n", SM[i].udpsockfd, i, inet_ntoa(SM[i].src.sin_addr), ntohs(SM[i].src.sin_port));
+                }
                 FD_SET(SM[i].udpsockfd, &readfds);
                 if (SM[i].udpsockfd > maxfd) maxfd = SM[i].udpsockfd;
             }
             Signal(semid, i);
         }
 
-        timeout.tv_sec = 1; // wait for 1 second for incoming messages
+        timeout.tv_sec = 1;
         timeout.tv_usec = 0;
         int activity = select(maxfd + 1, &readfds, NULL, NULL, &timeout);
         if (activity < 0) {
-            perror("select error");
+            perror("select");
             continue;
         }
 
+        // SELECT TIMEOUT
+
+        // check duplicate ACK sending condition
+        if (activity == 0) {
+            for (int i = 0; i < N; i++) {
+                Wait(semid, i);
+                if (!SM[i].isfree && SM[i].isbound && SM[i].nospace && SM[i].rwnd.size > 0) {
+                    char packet[KTP_HEADER_SIZE];
+                    build_packet(packet, "ACK\0", SM[i].last_ack_sent, SM[i].rwnd.size, NULL);
+                    sendto(SM[i].udpsockfd, packet, KTP_HEADER_SIZE, 0, (struct sockaddr *)&SM[i].dest, sizeof(SM[i].dest));
+                    SM[i].nospace = false; // reset nospace flag after sending ACK, no ACK-storm (that problem written in assignment)
+                }
+                Signal(semid, i);
+            }
+            continue;
+        }
+
+        // DATA or ACK arrived
         for (int i = 0; i < N; i++) {
             Wait(semid, i);
-            if (!SM[i].isfree && FD_ISSET(SM[i].udpsockfd, &readfds)) {
-                // receive the message and add it to the receiver window of the corresponding socket in SM
-                char buf[MSG_SIZE];
-                socklen_t addrlen = sizeof(SM[i].dest);
-                ssize_t recvlen = recvfrom(SM[i].udpsockfd, buf, MSG_SIZE, 0, (struct sockaddr*) &SM[i].dest, &addrlen);
+            if (!SM[i].isfree && SM[i].isbound && FD_ISSET(SM[i].udpsockfd, &readfds)) {
+                char packet[KTP_HEADER_SIZE + MSG_SIZE];
+                struct sockaddr_in src;
+                socklen_t addrlen = sizeof(src);
+
+                int recvlen = recvfrom(SM[i].udpsockfd, packet, sizeof(packet), 0, (struct sockaddr *)&src, &addrlen);
                 if (recvlen < 0) {
-                    perror("recvfrom error");
+                    perror("recvfrom");
                     Signal(semid, i);
                     continue;
                 }
-                // check if the receiver window is full
-                if ((SM[i].rwnd.start + 1) % BUF_SIZE == SM[i].rwnd.end) {
-                    // drop this message and continue
+
+                char type[MSG_TYPE + 1];
+                uint8_t seq;
+                uint8_t rwnd;
+                char msg[MSG_SIZE];
+                parse_packet(packet, type, &seq, &rwnd, msg);
+
+                // simulate unreliable channel
+                if (dropMessage(P)) {
+                    printf("Packet dropped: type = %s, seq = %d, rwnd = %d\n", type, seq, rwnd);
                     Signal(semid, i);
-                    continue; // receiver window is full
+                    continue;
                 }
-                // add the message to the receiver window, removing the KTP header
-                int idx = SM[i].rwnd.end;
-                // check in the empty slots of the receiver window, if the sequence number matches the expected sequence number for that slot, if not drop the message, otherwise add it to the receiver window
-                strncpy(SM[i].recv_buf[idx], buf + KTP_HEADER_SIZE, recvlen - KTP_HEADER_SIZE);
-                SM[i].rwnd.end = (SM[i].rwnd.end + 1) % BUF_SIZE;
+
+                // verify correct peer
+                if (src.sin_addr.s_addr != SM[i].dest.sin_addr.s_addr || src.sin_port != SM[i].dest.sin_port) {
+                    Signal(semid, i);
+                    continue;
+                }
+
+                // ACK RECEIVED
+                if (strcmp(type, "ACK") == 0) {
+                    // update sender window size
+                    if (SM[i].swnd.size > rwnd) SM[i].swnd.size = rwnd;
+                    // slide sender window only if this ACK advances it
+                    if ((uint8_t)(seq - SM[i].swnd.last_ack) < SEQ_NUM_MOD / 2) {
+                        slide_sender_window(i, seq);
+                    }
+                }
+                // DATA RECEIVED
+                else if (strcmp(type, "DATA") == 0) {
+                    window *W = &SM[i].rwnd;
+                    // drop packet if receiver buffer full
+                    if (W->size == 0) {
+                        SM[i].nospace = true;
+                        Signal(semid, i);
+                        continue;
+                    }
+
+                    uint8_t expected = (SM[i].last_ack_sent + 1) % SEQ_NUM_MOD;
+                    // check if packet is duplicate
+                    for (int k = W->start; k != W->end; k = (k + 1) % BUF_SIZE) {
+                        if (W->seq_num[k] == seq) {
+                            Signal(semid, i);
+                            continue;
+                        }
+                    }
+
+                    // compute offset from expected seq (wrap safe)
+                    uint8_t diff = (uint8_t)(seq - expected);
+                    // if packet outside receiver window -> drop
+                    if (diff >= BUF_SIZE) {
+                        printf("Packet with seq %d outside receiver window, expected %d\n", seq, expected);
+                        Signal(semid, i);
+                        continue;
+                    }
+
+                    int idx = (W->start + diff) % BUF_SIZE;
+                    // store packet
+                    memcpy(SM[i].recv_buf[idx], msg, MSG_SIZE);
+                    W->seq_num[idx] = seq;
+                    W->size--;
+                    if (W->size == 0) SM[i].nospace = true;
+
+                    // if this is the next expected packet
+                    if (seq == expected) {
+                        // slide window through contiguous packets
+                        while (W->seq_num[W->start] != 0) {
+                            SM[i].last_ack_sent = W->seq_num[W->start];
+                            W->seq_num[W->start] = 0;
+                            W->start = (W->start + 1) % BUF_SIZE;
+                        }
+
+                        send_ack(i, SM[i].last_ack_sent);
+                    }
+                    // out-of-order packets are stored but NOT ACKed
+                }
             }
             Signal(semid, i);
         }
@@ -62,47 +220,142 @@ void *threadR() {
 }
 
 void *threadS() {
-    // get messages from the sender window of each socket in SM and send them to the destination address through the corresponding UDP socket
-//     The thread S behaves in the following manner. It sleeps for some time (T/2), and wakes up
-// periodically. On waking up, it first checks whether the message timeout period (T) is over (by
-// computing the time difference between the current time and the time when the messages
-// within the window were sent last) for the messages sent over any of the active KTP sockets.
-// If yes, it retransmits all the messages within the current swnd for that KTP socket. It then
-// checks the current swnd for each of the KTP sockets and determines whether there is a
-// pending message from the sender-side message buffer that can be sent. If so, it sends that
-// message through the UDP sendto() call for the corresponding UDP socket and updates the
-// send timestamp.
+    printf("Sender thread started\n");
 
+    while (1) {
+        // sleep for T / 2 seconds
+        usleep((T * 1000000) / 2);
+        for (int i = 0; i < N; i++) {
+            Wait(semid, i);
+            if (SM[i].isfree || !SM[i].isbound) {
+                Signal(semid, i);
+                continue;
+            }
+            window *W = &SM[i].swnd;
+            time_t now = time(NULL);
+            
+            // Step 1: Check timeout for unacknowledged packets in swnd
+            bool timeout = false;
+            for (int j = W->start; j != W->end; j = (j + 1) % BUF_SIZE) {
+                if (W->timestamp[j] != -1 && difftime(now, W->timestamp[j]) >= T) {
+                    timeout = true;
+                    break;
+                }
+            }
+
+            // retransmit all packets in swnd
+            if (timeout) {
+                for (int j = W->start; j != W->end; j = (j + 1) % BUF_SIZE) {
+                    retransmit_packet(i, j);
+                }
+            }
+
+            // Step 2: Send new packets
+            // update swnd size based on unacknowledged packets
+            while (window_count(W)) {
+                int idx = W->start;
+                // nothing pending to send
+                if (SM[i].send_buf[idx][0] == '\0') {
+                    break;
+                }
+                send_new_packet(i, idx);
+                W->start = (W->start + 1) % BUF_SIZE;
+            }
+
+            Signal(semid, i);
+        }
+    }
 }
 
 void *threadG() {
-    // garbage collector thread to free up sockets that have not been closed properly by the user
+    printf("Garbage collector thread started\n");
+    
+    while (1) {
+        sleep(T);
+        for (int i = 0; i < N; i++) {
+            Wait(semid, i);
+            if (!SM[i].isfree) {
+                int pid = SM[i].pid;
+                // check if process still exists
+                if (kill(pid, 0) == -1 && errno == ESRCH) {
+                    Signal(semid, i);
+                    // cleanup via k_close
+                    k_close(i);
+                    printf("Garbage collector closed socket %d\n", i);
+                    continue;
+                }
+            }
+            Signal(semid, i);
+        }
+    }
+}
+
+void cleanup(int signo) {
+    // remove shared memory
+    if (shmid != -1) {
+        if (shmctl(shmid, IPC_RMID, NULL) == -1)
+            perror("shmctl");
+        else
+            printf("Shared memory %d removed\n", shmid);
+    }
+
+    // remove semaphore set
+    if (semid != -1) {
+        if (semctl(semid, 0, IPC_RMID) == -1)
+            perror("semctl");
+        else
+            printf("Semaphore set %d removed\n", semid);
+    }
+
+    if (signo == SIGSEGV)
+        printf("Program terminated due to segmentation fault\n");
+    else if (signo == SIGINT)
+        printf("Program terminated (Ctrl+C)\n");
+
+    if (signo != -1) exit(0);
+    exit(1);
 }
 
 int main() {
     // create shared memory SM and semaphore sem
     key_t SHM_KEY = ftok(".", 'H');
-    shmid = shmget(SHM_KEY, N * sizeof(int), IPC_CREAT | 0666);
-    SM = (sockinfo*) shmat(shmid, NULL, 0);
+    shmid = shmget(SHM_KEY, N * sizeof(sockinfo), IPC_CREAT | 0666);
+    if (shmid >= 0) SM = (sockinfo*) shmat(shmid, NULL, 0);
+    else {
+        perror("shmget");
+        cleanup(-1);
+    }
+
     for (int i = 0; i < N; i++) {
-        SM[i].isfree = 1;
+        SM[i].isfree = true;
         SM[i].udpsockfd = -1;
         SM[i].pid = -1;
-        SM[i].swnd.start = SM[i].swnd.end = 0;
-        SM[i].rwnd.start = SM[i].rwnd.end = 0;
     }
+    printf("Shared memory created with id %d\n", shmid);
     
     key_t SEM_KEY = ftok(".", 'E');
     semid = semget(SEM_KEY, N, IPC_CREAT | 0666);
+    if (semid < 0) {
+        perror("semget");
+        cleanup(-1);
+    }
     for (int i = 0; i < N; i++) {
         semctl(semid, i, SETVAL, 1); // initialize all semaphores to 1
     }
+    printf("Semaphore set created with id %d\n", semid);
+    
+    signal(SIGINT, cleanup);
+    signal(SIGSEGV, cleanup);
 
     // create 3 threads R, S and G
     pthread_t r_thread, s_thread, g_thread;
     pthread_create(&r_thread, NULL, threadR, NULL);
     pthread_create(&s_thread, NULL, threadS, NULL);
     pthread_create(&g_thread, NULL, threadG, NULL);
+
+    pthread_exit(NULL);
+
+    // while (1) pause(); // wait for signals
 
     return 0;
 }

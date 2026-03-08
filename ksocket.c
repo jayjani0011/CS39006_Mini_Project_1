@@ -2,19 +2,30 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 int k_socket(int domain, int type, int protocol) {
     if (domain != AF_INET || type != SOCK_KTP || protocol != 0) {
-        return -1; // invalid arguments
+        return -1;
     }
-    // find a free entry in SM and allocate a new socket
+
+    // printf("k_socket called with domain = %d, type = %d, protocol = %d\n", domain, type, protocol);
+
     for (int i = 0; i < N; i++) {
+        // printf("k_socket: Checking socket index %d, isfree = %d\n", i, SM[i].isfree);
         Wait(semid, i);
         if (SM[i].isfree) {
-            SM[i].isfree = false;
-            SM[i].udpsockfd = socket(AF_INET, SOCK_DGRAM, 0); // assign sockfd as index in SM
-            SM[i].pid = getpid(); // to get the pid of the calling process
+            // int fd = socket(AF_INET, SOCK_DGRAM, 0);
+            // if (fd < 0) {
+            //     Signal(semid, i);
+            //     return -1;
+            // }
 
+            SM[i].isfree = false;
+            // SM[i].udpsockfd = fd;
+            SM[i].pid = getpid();
+            SM[i].swnd = init_window();
+            SM[i].rwnd = init_window();
             printf("Socket created with k_sockfd : %d\n", i);
 
             Signal(semid, i);
@@ -22,57 +33,57 @@ int k_socket(int domain, int type, int protocol) {
         }
         Signal(semid, i);
     }
-
     errno = ENOSPACE;
-    return -1; // no free entry found
+    return -1;
 }
 
 int k_bind(int sockfd, struct sockaddr* src, struct sockaddr* dest) {
     Wait(semid, sockfd);
     if (sockfd < 0 || sockfd >= N || SM[sockfd].isfree) {
         Signal(semid, sockfd);
-        return -1; // invalid socket
+        return -1;
     }
-
-    // bind the socket to the source and destination addresses
-    bind(SM[sockfd].udpsockfd, src, sizeof(*src));
-    SM[sockfd].dest = *((struct sockaddr_in*) dest);
+    // bind(SM[sockfd].udpsockfd, src, sizeof(struct sockaddr_in));
+    SM[sockfd].isbound = true;
+    SM[sockfd].dest = *((struct sockaddr_in*)dest);
+    SM[sockfd].src = *((struct sockaddr_in*)src);
+    printf("Binding k_sockfd %d to Dest IP : %s, PORT : %d\n", sockfd, inet_ntoa(SM[sockfd].dest.sin_addr), ntohs(SM[sockfd].dest.sin_port));
     Signal(semid, sockfd);
     return 0;
 }
 
 ssize_t k_sendto(int sockfd, const void* buf, size_t len, int flags, const struct sockaddr* dest_addr, socklen_t addrlen) {
-    Wait(semid, sockfd);
-    if (sockfd < 0 || sockfd >= N || SM[sockfd].isfree) {
-        Signal(semid, sockfd);
-        return -1; // invalid socket
+    if (sockfd < 0 || sockfd >= N) {
+        errno = EBADF;
+        return -1;
     }
 
-    // check if the destination address matches the one bound to the socket
-    struct sockaddr_in* dest = (struct sockaddr_in*) dest_addr;
-    if (dest->sin_port != SM[sockfd].dest.sin_port || dest->sin_addr.s_addr != SM[sockfd].dest.sin_addr.s_addr) {
-        // drop this message and return an error
+    Wait(semid, sockfd);
+    if (SM[sockfd].isfree) {
+        Signal(semid, sockfd);
+        return -1;
+    }
+    struct sockaddr_in* dest = (struct sockaddr_in*)dest_addr;
+    if (!SM[sockfd].isbound || dest->sin_port != SM[sockfd].dest.sin_port || dest->sin_addr.s_addr != SM[sockfd].dest.sin_addr.s_addr) {
+        printf("k_sendto: Socket %d not bound to the specified destination\n", sockfd);
         errno = ENOTBOUND;
         Signal(semid, sockfd);
-        return -1; // destination address mismatch
+        return -1;
     }
 
-    // check if the sender window is full
-    if ((SM[sockfd].swnd.start + 1) % BUF_SIZE == SM[sockfd].swnd.end) {
-        // drop this message and return an error
+    if (SM[sockfd].swnd.size == 0 || (SM[sockfd].swnd.end + 1) % BUF_SIZE == SM[sockfd].swnd.start) {
+        printf("k_sendto: Socket %d sender window full, cannot send new packet\n", sockfd);
         errno = ENOSPACE;
         Signal(semid, sockfd);
-        return -1; // sender window is full
+        return -1;
     }
+    SM[sockfd].swnd.size--;   // reserve space in sender window
 
-    // add the message to the sender window
     int idx = SM[sockfd].swnd.end;
-    strncpy(SM[sockfd].send_buf[idx], (char*) buf, len);
+    strncpy(SM[sockfd].send_buf[idx], (char*)buf, len);
     SM[sockfd].swnd.end = (SM[sockfd].swnd.end + 1) % BUF_SIZE;
-
-    // send the message to the destination address
-    // sendto(SM[sockfd].udpsockfd, buf, len, flags, dest_addr, addrlen);
     Signal(semid, sockfd);
+
     return len;
 }
 
@@ -80,45 +91,79 @@ ssize_t k_recvfrom(int sockfd, void* buf, size_t len, int flags, struct sockaddr
     Wait(semid, sockfd);
     if (sockfd < 0 || sockfd >= N || SM[sockfd].isfree) {
         Signal(semid, sockfd);
-        return -1; // invalid socket
+        return -1;
     }
-
-    // check if the receiver window is empty
     if (SM[sockfd].rwnd.start == SM[sockfd].rwnd.end) {
-        // no message to receive, return an error
+        printf("k_recvfrom: Socket %d receiver window empty, no message to receive\n", sockfd);
         errno = ENOMESSAGE;
         Signal(semid, sockfd);
-        return -1; // receiver window is empty
+        return -1;
     }
 
-    // get the message from the receiver window
     int idx = SM[sockfd].rwnd.start;
-    strncpy((char*) buf, SM[sockfd].recv_buf[idx], len);
+    strncpy((char*)buf, SM[sockfd].recv_buf[idx], len);
     SM[sockfd].rwnd.start = (SM[sockfd].rwnd.start + 1) % BUF_SIZE;
-
-    // set the source address and address length
-    // struct sockaddr_in* src = (struct sockaddr_in*) src_addr;
-    // *src = SM[sockfd].dest; // source address is the destination address bound to the socket
-    // *addrlen = sizeof(*src);
+    SM[sockfd].rwnd.size++;   // free space increased
 
     Signal(semid, sockfd);
+
     return len;
 }
 
-int close(int fd) {
+int k_close(int fd){
+    if (fd < 0 || fd >= N) return -1;
+
     Wait(semid, fd);
-    if (fd < 0 || fd >= N) {
+    if (SM[fd].isfree) {
         Signal(semid, fd);
-        return -1; // invalid socket
+        return -1;
     }
 
-    // close the corresponding UDP socket and mark this entry as free
-    if (!SM[fd].isfree) close(SM[fd].udpsockfd);
+    // close UDP socket
+    if (SM[fd].udpsockfd >= 0) close(SM[fd].udpsockfd);
+
+    // reset socket state
     SM[fd].isfree = true;
+    SM[fd].isbound = false;
+    SM[fd].pid = -1;
+    SM[fd].udpsockfd = -1;
+    SM[fd].nospace = false;
+
+    memset(SM[fd].send_buf, 0, sizeof(SM[fd].send_buf));
+    memset(SM[fd].recv_buf, 0, sizeof(SM[fd].recv_buf));
+
+    // reset sender window
+    SM[fd].swnd.start = 0;
+    SM[fd].swnd.end = 0;
+    SM[fd].swnd.last_ack = 0;
+    SM[fd].swnd.last_seq = 0;
+
+    // reset receiver window
+    SM[fd].rwnd.start = 0;
+    SM[fd].rwnd.end = 0;
+    SM[fd].rwnd.size = BUF_SIZE;
+
     Signal(semid, fd);
     return 0;
 }
 
 bool dropMessage(float p) {
-    return ((float) rand() / RAND_MAX) < p; // return true with probability p
+    srand(time(NULL));
+    return ((float)rand() / RAND_MAX) < p;
+}
+
+window init_window() {
+    window W;
+    W.start = 0;
+    W.end = 0;
+    W.size = WINDOW_SIZE - 1;
+    W.last_ack = 0;
+    W.last_seq = 0;
+    
+    for (int i = 0; i < BUF_SIZE; i++) {
+        W.seq_num[i] = 0;
+        W.timestamp[i] = -1;
+    }
+
+    return W;
 }

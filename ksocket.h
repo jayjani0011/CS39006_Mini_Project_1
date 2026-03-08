@@ -9,11 +9,15 @@
 #include <sys/shm.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #define SOCK_KTP 101
 #define BUF_SIZE 10
 #define WINDOW_SIZE 10
 #define MSG_SIZE 512
+#define MSG_TYPE 4
+#define SEQ_NUM_MOD 256
+#define KTP_HEADER_SIZE (MSG_TYPE + 2*sizeof(uint8_t))
 #define N 10
 #define T 5
 #define P 0.3
@@ -28,23 +32,28 @@ int shmid;
 typedef struct {
     int start;
     int end;
-    int seq_num[BUF_SIZE]; // sequence number for each slot in the window
+    int size;
+    uint8_t seq_num[BUF_SIZE]; // sequence number for each slot in the window
     // expected sequence number for the next message to be added to each slot in the window for rwnd
     // contains the sequence numbers of the messages sent, but not yet acknowledged for swnd
-    int last_ack; // sequence number of the last acknowledged message for swnd
-    int last_seq; // sequence number of the last sent message for swnd
+    uint8_t last_ack; // sequence number of the last acknowledged message for swnd
+    uint8_t last_seq; // sequence number of the last sent message for swnd
+    time_t timestamp[BUF_SIZE]; // timestamp for each slot in the window, used for retransmission timeout
 } window;
 
 typedef struct {
-    int udpsockfd; // corresponding UDP socket file descriptor
+    int udpsockfd;
     int pid;
-    bool isfree; // 1 if this entry is free, 0 otherwise
-    // sockaddr_in src;
+    bool isfree;
+    bool isbound;
+    struct sockaddr_in src;
     struct sockaddr_in dest;
     char send_buf[BUF_SIZE][MSG_SIZE];
     char recv_buf[BUF_SIZE][MSG_SIZE];
-    window swnd; // sender window
-    window rwnd; // receiver window
+    window swnd;
+    window rwnd;
+    bool nospace;        // receiver buffer previously full
+    uint8_t last_ack_sent;
 } sockinfo;
 
 sockinfo* SM; // shared memory for storing sockinfo of all sockets
@@ -57,9 +66,11 @@ ssize_t k_sendto(int sockfd, const void* buf, size_t len, int flags, const struc
 
 ssize_t k_recvfrom(int sockfd, void* buf, size_t len, int flags, struct sockaddr* src_addr, socklen_t *addrlen);
 
-int close(int fd);
+int k_close(int fd);
 
 bool dropMessage(float p);
+
+window init_window();
 
 static inline void _sem_op(int semid, int idx, int op) {
     struct sembuf sb = {(unsigned short)idx, (short)op, 0};
