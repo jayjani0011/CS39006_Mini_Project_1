@@ -20,7 +20,7 @@
 #define KTP_HEADER_SIZE (MSG_TYPE + 2*sizeof(uint8_t))
 #define N 10
 #define T 5
-#define P 0.3
+#define P 0
 
 #define ENOSPACE ENOSPC
 #define ENOTBOUND ENOTCONN

@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+const char *eof_marker = "~";
+
 int main(int argc, char *argv[]) {
     if (argc != 6) {
         printf("Usage: %s <src_ip> <src_port> <dest_ip> <dest_port> <file>\n", argv[0]);
@@ -56,15 +58,23 @@ int main(int argc, char *argv[]) {
     }
 
     sleep(2); // wait for receiver to be ready
-    char buffer[MSG_SIZE];
+    char buffer[MSG_SIZE + 1];
+    bool done = false;
 
     while (1) {
+        buffer[0] = '\0';
         size_t bytes = fread(buffer, 1, MSG_SIZE, fp);
+        buffer[bytes] = '\0';
 
-        if (bytes == 0) break;
+        if (bytes == 0) {
+            done = true;
+            printf("user1: End of file reached.\n");
+            strcpy(buffer, eof_marker);
+            bytes = 1;
+        }
 
         while (1) {
-            int ret = k_sendto(sockfd, buffer, MSG_SIZE, 0, (struct sockaddr *)&dest, sizeof(dest));
+            int ret = k_sendto(sockfd, buffer, bytes, 0, (struct sockaddr *)&dest, sizeof(dest));
             int err = errno;
             if (ret >= 0) break;
             printf("k_sendto error: %d\n", err);
@@ -75,12 +85,20 @@ int main(int argc, char *argv[]) {
             // sender window full — wait a bit so ACK thread can slide window
             sleep(1);
         }
-
+        
         printf("Sent %zu bytes\n", bytes);
+        sleep(1); // simulate processing time
+
+        if(done) {
+            printf("user1: EOF marker sent.\n");
+            break;
+        }
     }
 
     printf("File sent successfully\n");
     fclose(fp);
+
+    sleep(100); // this will prevent threadS to ignore this sockfd
     k_close(sockfd);
 
     return 0;

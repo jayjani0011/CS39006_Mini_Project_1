@@ -16,7 +16,7 @@ void build_packet(char *packet, const char *type, uint8_t seq, uint8_t rwnd, con
     memcpy(packet, type, MSG_TYPE);
     memcpy(packet + MSG_TYPE, &seq, sizeof(uint8_t));
     memcpy(packet + MSG_TYPE + sizeof(uint8_t), &rwnd, sizeof(uint8_t));
-    if (msg != NULL) memcpy(packet + KTP_HEADER_SIZE, msg, MSG_SIZE);
+    if (strcmp(type, "ACK")) memcpy(packet + KTP_HEADER_SIZE, msg, MSG_SIZE);
 }
 
 void parse_packet(const char *packet, char *type, uint8_t *seq, uint8_t *rwnd, char *msg) {
@@ -24,7 +24,10 @@ void parse_packet(const char *packet, char *type, uint8_t *seq, uint8_t *rwnd, c
     type[MSG_TYPE] = '\0';
     memcpy(seq, packet + MSG_TYPE, sizeof(uint8_t));
     memcpy(rwnd, packet + MSG_TYPE + sizeof(uint8_t), sizeof(uint8_t));
-    if (msg != NULL) memcpy(msg, packet + KTP_HEADER_SIZE, MSG_SIZE);
+    if (strcmp(type, "ACK")) {
+        memcpy(msg, packet + KTP_HEADER_SIZE, MSG_SIZE);
+        msg[MSG_SIZE] = '\0';
+    }
 }
 
 int window_count(window *W) {
@@ -45,9 +48,17 @@ void retransmit_packet(int sockindex, int bufindex) {
     SM[sockindex].swnd.timestamp[bufindex] = time(NULL);
 }
 
+// returns next sequence number, handling wrap around
+// never use 0 as a valid sequence number, since we initialize all seq_num in window to 0 to indicate empty slot
+uint8_t next_seq(int seq) {
+    if (seq == (uint8_t)(-1)) return 1;
+    return (uint8_t)(seq + 1);
+}
+
 void send_new_packet(int sockindex, int bufindex) {
     char packet[KTP_HEADER_SIZE + MSG_SIZE];
-    uint8_t seq = ++SM[sockindex].swnd.last_seq;
+    SM[sockindex].swnd.last_seq = next_seq(SM[sockindex].swnd.last_seq);
+    uint8_t seq = SM[sockindex].swnd.last_seq;
     SM[sockindex].swnd.seq_num[bufindex] = seq;
     build_packet(packet, "DATA", seq, SM[sockindex].rwnd.size, SM[sockindex].send_buf[bufindex]);
     sendto(SM[sockindex].udpsockfd, packet, sizeof(packet), 0, (struct sockaddr *)&SM[sockindex].dest, sizeof(SM[sockindex].dest));
@@ -56,12 +67,12 @@ void send_new_packet(int sockindex, int bufindex) {
 
 void slide_sender_window(int sockindex, uint8_t ack_seq) {
     window *W = &SM[sockindex].swnd;
-    while (W->start != W->end && W->seq_num[W->start] != (ack_seq + 1) % SEQ_NUM_MOD) {
+    while (W->start != W->end && (W->seq_num[W->start] != next_seq(ack_seq) || W->seq_num[W->start] != 0)) {
         int idx = W->start;
         memset(SM[sockindex].send_buf[idx], 0, MSG_SIZE);
         W->start = (W->start + 1) % BUF_SIZE;
-        W->last_ack = ack_seq;
     }
+    W->last_ack = ack_seq;
 }
 
 void *threadR() {
@@ -70,6 +81,7 @@ void *threadR() {
     printf("Receiver thread started\n");
 
     while (1) {
+        printf("Receiver thread awake, checking for incoming packets\n");
         // Build fd set
         FD_ZERO(&readfds);
         int maxfd = -1;
@@ -137,13 +149,12 @@ void *threadR() {
                     continue;
                 }
 
-                char type[MSG_TYPE + 1];
-                uint8_t seq;
-                uint8_t rwnd;
-                char msg[MSG_SIZE];
+                char type[MSG_TYPE + 1], msg[MSG_SIZE + 1];
+                uint8_t seq, rwnd;
+                msg[0] = '\0';
                 parse_packet(packet, type, &seq, &rwnd, msg);
 
-                printf("Packet received on k_socket %d: type = %s, seq = %d, rwnd = %d\n", i, type, seq, rwnd);
+                printf("Packet received on k_socket %d: type = %s, seq = %d, rwnd = %d, msg = \n%s\n", i, type, seq, rwnd, msg);
 
                 // simulate unreliable channel
                 if (dropMessage(P)) {
@@ -163,7 +174,8 @@ void *threadR() {
                     // update sender window size
                     SM[i].swnd.size = rwnd;
                     // slide sender window only if this ACK advances it
-                    if ((uint8_t)(seq - SM[i].swnd.last_ack) < SEQ_NUM_MOD / 2) {
+                    printf("ACK received for seq %d on k_socket %d, sender window size updated to %d, last acknowledged seq = %d\n", seq, i, rwnd, SM[i].swnd.last_ack);
+                    if ((uint8_t)(SM[i].swnd.last_ack - seq) < SEQ_NUM_MOD / 2) {
                         slide_sender_window(i, seq);
                     }
                 }
@@ -177,7 +189,7 @@ void *threadR() {
                         continue;
                     }
 
-                    uint8_t expected = (SM[i].last_ack_sent + 1) % SEQ_NUM_MOD;
+                    uint8_t expected = next_seq(SM[i].last_ack_sent);
                     // check if packet is duplicate
                     for (int k = W->start; k != W->end; k = (k + 1) % BUF_SIZE) {
                         if (W->seq_num[k] == seq) {
@@ -190,35 +202,37 @@ void *threadR() {
                     uint8_t diff = (uint8_t)(seq - expected);
                     // if packet outside receiver window -> drop
                     // need to send duplicate ACK for duplicate packet
-                    if (seq == SM[i].last_ack_sent) {
-                        printf("Duplicate packet with seq %d received, expected %d. Resending ACK for last acknowledged seq %d\n", seq, expected, SM[i].last_ack_sent);
-                        char packet[KTP_HEADER_SIZE];
-                        build_packet(packet, "ACK\0", seq, SM[i].rwnd.size, NULL);
-                        sendto(SM[i].udpsockfd, packet, KTP_HEADER_SIZE, 0, (struct sockaddr *)&SM[i].dest, sizeof(SM[i].dest));
-                    }
-                    else if (diff >= BUF_SIZE) {
+                    if (diff >= BUF_SIZE) {
                         printf("Packet with seq %d outside receiver window, expected %d\n", seq, expected);
+                        if ((uint8_t)(SM[i].last_ack_sent - seq) < SEQ_NUM_MOD / 2) {
+                            printf("Packet with seq %d is a new packet outside receiver window, sending ACK for last acknowledged seq %d\n", seq, SM[i].last_ack_sent);
+                            char packet[KTP_HEADER_SIZE];
+                            build_packet(packet, "ACK\0", SM[i].last_ack_sent, SM[i].rwnd.size, NULL);
+                            sendto(SM[i].udpsockfd, packet, KTP_HEADER_SIZE, 0, (struct sockaddr *)&SM[i].dest, sizeof(SM[i].dest));
+                        }
                         Signal(semid, i);
                         continue;
                     }
 
                     int idx = (W->start + diff) % BUF_SIZE;
                     // store packet
-                    memcpy(SM[i].recv_buf[idx], msg, MSG_SIZE);
+                    strncpy(SM[i].recv_buf[idx], msg, strlen(msg));
                     W->seq_num[idx] = seq;
                     W->size--;
                     if (W->size == 0) SM[i].nospace = true;
+                    printf("Stored packet with seq %d at recv buffer index %d for k_socket %d\n", seq, idx, i);
 
                     // if this is the next expected packet
                     if (seq == expected) {
                         // slide window through contiguous packets
-                        while (W->seq_num[W->start] != 0) {
-                            SM[i].last_ack_sent = W->seq_num[W->start];
-                            W->seq_num[W->start] = 0;
-                            W->start = (W->start + 1) % BUF_SIZE;
+                        for (int idx = W->start; W->seq_num[idx] != 0; idx = (idx + 1) % BUF_SIZE) {
+                            SM[i].last_ack_sent = W->seq_num[idx];
+                            printf("Sliding receiver window, ACKing seq %d for k_socket %d\n", SM[i].last_ack_sent, i);
+                            W->seq_num[idx] = 0; // will this create issue for duplicate ACK sending?
                         }
 
                         send_ack(i, SM[i].last_ack_sent);
+                        printf("Sent ACK for seq %d for k_socket %d\n", SM[i].last_ack_sent, i);
                     }
                     // out-of-order packets are stored but NOT ACKed
                 }
@@ -238,6 +252,7 @@ void *threadS() {
         for (int i = 0; i < N; i++) {
             Wait(semid, i);
             if (SM[i].isfree || !SM[i].isbound) {
+                // if (i < 2) printf("k_socket %d is free or not bound, skipping\n", i);
                 Signal(semid, i);
                 continue;
             }
@@ -256,18 +271,25 @@ void *threadS() {
             // retransmit all packets in swnd
             if (timeout) {
                 for (int j = W->start; j != W->end; j = (j + 1) % BUF_SIZE) {
+                    printf("Timeout for packet with seq %d in buffer index %d for k_socket %d, retransmitting\n", W->seq_num[j], j, i);
                     retransmit_packet(i, j);
                 }
             }
 
             // Step 2: Send new packets
             // update swnd size based on unacknowledged packets
-            for (int idx = W->start; idx != W->end && W->size > 0; idx = (idx + 1) % BUF_SIZE, W->size--) {
+            for (int idx = W->start; idx != W->end && W->size > 0; idx = (idx + 1) % BUF_SIZE) {
                 if (SM[i].send_buf[idx][0] == '\0') {
+                    printf("No new packet to send for k_socket %d\n", i);
                     break;
                 }
-                printf("Sending new packet with seq %d from buffer index %d for k_socket %d\n", W->last_seq + 1, idx, i);
+                if (SM[i].swnd.timestamp[idx] != -1) {
+                    printf("Packet with seq %d in buffer index %d for k_socket %d already sent, skipping\n", W->seq_num[idx], idx, i);
+                    continue;
+                }
                 send_new_packet(i, idx);
+                W->size--; // decrease swnd size for each new packet sent
+                printf("Sent new packet with seq %d from buffer index %d for k_socket %d, msg : \n%s\n", W->last_seq, idx, i, SM[i].send_buf[idx]);
             }
 
             Signal(semid, i);

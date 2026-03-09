@@ -79,8 +79,9 @@ ssize_t k_sendto(int sockfd, const void* buf, size_t len, int flags, const struc
     }
 
     int idx = SM[sockfd].swnd.end;
-    strncpy(SM[sockfd].send_buf[idx], (char*)buf, len);
+    strcpy(SM[sockfd].send_buf[idx], (char*)buf);
     SM[sockfd].swnd.end = (SM[sockfd].swnd.end + 1) % BUF_SIZE;
+    printf("k_sendto : Buffered message for k_socket %d at buffer index %d, msg : \n%s\n", sockfd, idx, SM[sockfd].send_buf[idx]);
     Signal(semid, sockfd);
 
     return len;
@@ -92,7 +93,7 @@ ssize_t k_recvfrom(int sockfd, void* buf, size_t len, int flags, struct sockaddr
         Signal(semid, sockfd);
         return -1;
     }
-    if (SM[sockfd].rwnd.start == SM[sockfd].rwnd.end) {
+    if (SM[sockfd].rwnd.size == WINDOW_SIZE - 1) {
         printf("k_recvfrom: Socket %d receiver window empty, no message to receive\n", sockfd);
         errno = ENOMESSAGE;
         Signal(semid, sockfd);
@@ -100,13 +101,14 @@ ssize_t k_recvfrom(int sockfd, void* buf, size_t len, int flags, struct sockaddr
     }
 
     int idx = SM[sockfd].rwnd.start;
-    strncpy((char*)buf, SM[sockfd].recv_buf[idx], len);
+    strcpy((char*)buf, SM[sockfd].recv_buf[idx]);
+    printf("k_recvfrom: Received message for k_socket %d from buffer index %d, msg : \n%s\n", sockfd, idx, (char*)buf);
     SM[sockfd].rwnd.start = (SM[sockfd].rwnd.start + 1) % BUF_SIZE;
     SM[sockfd].rwnd.size++;   // free space increased
 
     Signal(semid, sockfd);
 
-    return len;
+    return strlen((char*)buf);
 }
 
 int k_close(int fd){
@@ -160,7 +162,7 @@ window init_window() {
     W.last_seq = 0;
     
     for (int i = 0; i < BUF_SIZE; i++) {
-        W.seq_num[i] = 0;
+        W.seq_num[i] = 0; // initialize sequence numbers to 0 to indicate empty slots
         W.timestamp[i] = -1;
     }
 

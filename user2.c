@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+const char *eof_marker = "~";
+
 int main(int argc, char *argv[]) {
     if (argc != 6) {
         printf("Usage: %s <src_ip> <src_port> <dest_ip> <dest_port> <output_file>\n", argv[0]);
@@ -53,8 +55,9 @@ int main(int argc, char *argv[]) {
     }
 
     sleep(2); // wait for sender to be ready
-    char buffer[MSG_SIZE];
+    char buffer[MSG_SIZE + 1];
     while (1) {
+        buffer[0] = '\0';
         ssize_t r = k_recvfrom(sockfd, buffer, MSG_SIZE, 0, NULL, NULL);
         if (r < 0) {
             if (errno == ENOMESSAGE || errno == EINVAL) {
@@ -64,9 +67,18 @@ int main(int argc, char *argv[]) {
             perror("k_recvfrom");
             exit(1);
         }
-        fwrite(buffer, 1, MSG_SIZE, fp);
+        buffer[r] = '\0'; // null terminate the received message
+
+        if (memcmp(buffer, eof_marker, 1) == 0)
+        {
+            printf("user2: EOF marker received\n");
+            break;
+        }
+
+        fwrite(buffer, 1, r, fp);
         fflush(fp);
         printf("Received %zu bytes\n", r);
+        sleep(1); // simulate processing time
     }
 
     fclose(fp);
