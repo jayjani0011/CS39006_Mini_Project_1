@@ -5,6 +5,9 @@
 
 const char *eof_marker = "~";
 
+extern int semid, shmid;
+extern sockinfo* SM;
+
 int main(int argc, char *argv[]) {
     if (argc != 6) {
         printf("Usage: %s <src_ip> <src_port> <dest_ip> <dest_port> <file>\n", argv[0]);
@@ -13,7 +16,11 @@ int main(int argc, char *argv[]) {
 
     key_t SHM_KEY = ftok(".", 'H');
     shmid = shmget(SHM_KEY, N * sizeof(sockinfo), IPC_CREAT | 0666);
-    if (shmid >= 0) SM = (sockinfo*) shmat(shmid, NULL, 0);
+    printf("SHMID : %d\n", shmid);
+
+    if (shmid >= 0) {
+        SM = (sockinfo*) shmat(shmid, NULL, 0);
+    }
     else {
         perror("shmget");
         exit(1);

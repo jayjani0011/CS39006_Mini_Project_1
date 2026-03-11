@@ -4,15 +4,26 @@
 #include <string.h>
 #include <time.h>
 
+int semid, shmid;
+sockinfo* SM; // shared memory for storing sockinfo of all sockets
+
 int k_socket(int domain, int type, int protocol) {
     if (domain != AF_INET || type != SOCK_KTP || protocol != 0) {
         return -1;
     }
 
-    // printf("k_socket called with domain = %d, type = %d, protocol = %d\n", domain, type, protocol);
+    printf("k_socket called with domain = %d, type = %d, protocol = %d\n", domain, type, protocol);
+
+    if (!SM) {
+        printf("Shared memory is not created\n");
+        return -1;
+    }
 
     for (int i = 0; i < N; i++) {
-        // printf("k_socket: Checking socket index %d, isfree = %d\n", i, SM[i].isfree);
+        printf("k_socket: Checking socket index %d, isfree = ", i);
+        fflush(stdout);
+        printf("%d\n", SM[i].isfree);
+        fflush(stdout);
         Wait(semid, i);
         if (SM[i].isfree) {
             // int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -22,6 +33,8 @@ int k_socket(int domain, int type, int protocol) {
             // }
 
             SM[i].isfree = false;
+            SM[i].nospace = 0;
+            SM[i].last_ack_time = -1;
             // SM[i].udpsockfd = fd;
             SM[i].pid = getpid();
             SM[i].swnd = init_window();
@@ -80,6 +93,7 @@ ssize_t k_sendto(int sockfd, const void* buf, size_t len, int flags, const struc
 
     int idx = SM[sockfd].swnd.end;
     strcpy(SM[sockfd].send_buf[idx], (char*)buf);
+    SM[sockfd].send_buf[idx][len] = '\0';
     SM[sockfd].swnd.end = (SM[sockfd].swnd.end + 1) % BUF_SIZE;
     printf("k_sendto : Buffered message for k_socket %d at buffer index %d, msg : \n%s\n", sockfd, idx, SM[sockfd].send_buf[idx]);
     Signal(semid, sockfd);
@@ -93,7 +107,7 @@ ssize_t k_recvfrom(int sockfd, void* buf, size_t len, int flags, struct sockaddr
         Signal(semid, sockfd);
         return -1;
     }
-    if (SM[sockfd].rwnd.size == WINDOW_SIZE - 1) {
+    if (SM[sockfd].rwnd.size == WINDOW_SIZE - 1 || SM[sockfd].rwnd.start == SM[sockfd].rwnd.end) {
         printf("k_recvfrom: Socket %d receiver window empty, no message to receive\n", sockfd);
         errno = ENOMESSAGE;
         Signal(semid, sockfd);

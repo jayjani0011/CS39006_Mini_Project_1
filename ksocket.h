@@ -1,3 +1,5 @@
+#pragma once
+
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -20,14 +22,11 @@
 #define KTP_HEADER_SIZE (MSG_TYPE + 2*sizeof(uint8_t))
 #define N 10
 #define T 5
-#define P 0
+#define P 0.3
 
 #define ENOSPACE ENOSPC
 #define ENOTBOUND ENOTCONN
 #define ENOMESSAGE ENOMSG
-
-int semid;
-int shmid;
 
 typedef struct {
     int start;
@@ -48,15 +47,14 @@ typedef struct {
     bool isbound;
     struct sockaddr_in src;
     struct sockaddr_in dest;
-    char send_buf[BUF_SIZE][MSG_SIZE];
-    char recv_buf[BUF_SIZE][MSG_SIZE];
+    char send_buf[BUF_SIZE][MSG_SIZE + 1];
+    char recv_buf[BUF_SIZE][MSG_SIZE + 1];
     window swnd;
     window rwnd;
-    bool nospace;        // receiver buffer previously full
+    int nospace;        // receiver buffer previously full
     uint8_t last_ack_sent;
+    time_t last_ack_time;
 } sockinfo;
-
-sockinfo* SM; // shared memory for storing sockinfo of all sockets
 
 int k_socket(int domain, int type, int protocol);
 

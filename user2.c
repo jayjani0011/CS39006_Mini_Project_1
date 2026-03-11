@@ -5,6 +5,9 @@
 
 const char *eof_marker = "~";
 
+extern int semid, shmid;
+extern sockinfo* SM;
+
 int main(int argc, char *argv[]) {
     if (argc != 6) {
         printf("Usage: %s <src_ip> <src_port> <dest_ip> <dest_port> <output_file>\n", argv[0]);
