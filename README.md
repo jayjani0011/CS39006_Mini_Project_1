@@ -1,4 +1,8 @@
 # Computer Networks Lab : Mini Project 1
+
+Jay Jani - 23CS10027
+Shresth Jha - 23CS30024
+
 ## Setup and Running
 
 ## Run locally
