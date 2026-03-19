@@ -84,7 +84,7 @@ int main(int argc, char *argv[]) {
             int ret = k_sendto(sockfd, buffer, bytes, 0, (struct sockaddr *)&dest, sizeof(dest));
             int err = errno;
             if (ret >= 0) break;
-            printf("k_sendto error: %d\n", err);
+            // printf("k_sendto error: %d\n", err);
             if (err != ENOSPACE && err != ENOTBOUND && err != EINVAL) {
                 perror("k_sendto");
                 exit(1);

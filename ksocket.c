@@ -116,6 +116,7 @@ ssize_t k_recvfrom(int sockfd, void* buf, size_t len, int flags, struct sockaddr
 
     int idx = SM[sockfd].rwnd.start;
     strcpy((char*)buf, SM[sockfd].recv_buf[idx]);
+    memset(SM[sockfd].recv_buf[idx], 0, MSG_SIZE); // clear the buffer after reading
     printf("k_recvfrom: Received message for k_socket %d from buffer index %d, msg : \n%s\n", sockfd, idx, (char*)buf);
     SM[sockfd].rwnd.start = (SM[sockfd].rwnd.start + 1) % BUF_SIZE;
     SM[sockfd].rwnd.size++;   // free space increased
