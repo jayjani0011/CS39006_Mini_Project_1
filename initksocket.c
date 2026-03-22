@@ -44,10 +44,6 @@ void parse_packet(const char *packet, char *type, uint8_t *seq, uint8_t *rwnd, c
     }
 }
 
-int window_count(window *W) {
-    return (W->end - W->start + BUF_SIZE) % BUF_SIZE;
-}
-
 void send_ack(int sockindex, uint8_t seq) {
     char packet[KTP_HEADER_SIZE];
     build_packet(packet, "ACK\0", seq, SM[sockindex].rwnd.size, NULL);

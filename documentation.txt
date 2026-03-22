@@ -1,0 +1,336 @@
+=====================================
+Mini Project 1 Submission
+Group Details:
+Member 1 Name: Jay Jani
+Member 1 Roll Number: 23CS10027
+Member 2 Name: Shresth Jha
+Member 2 Roll Number: 23CS30024
+=====================================
+
+===========================================================================
+SECTION 1: FINDINGS — Average Transmissions per Message vs Drop Probability
+===========================================================================
+
+[To be filled]
+
+
+===========================================================================
+SECTION 2: DATA STRUCTURES
+===========================================================================
+
+---------------------------------------------------------------------------
+2.1  ksocket.h
+---------------------------------------------------------------------------
+
+struct window
+--------------
+Tracks the state of either the sender window (swnd) or receiver window (rwnd)
+for a single KTP socket.
+
+  int start        — Index into the circular buffer where the window begins.
+                     For swnd: oldest unacknowledged message. For rwnd: oldest
+                     unread message waiting to be consumed by the application.
+
+  int end          — Index into the circular buffer 'one past' the last occupied
+                     slot. New messages are placed here before end is advanced.
+
+  int size         — Number of buffer slots currently available in the window.
+                     For swnd: how many more messages may be sent before waiting
+                     for an ACK. For rwnd: how many more messages the receiver
+                     can accept (i.e., free space in the receive buffer).
+
+  uint8_t seq_num[BUF_SIZE]
+                   — Parallel array that stores the sequence number assigned to
+                     the message held at each buffer index. A value of 0 means
+                     the slot is empty / not yet in use (sequence numbers 1-255
+                     are valid; 0 is reserved as a sentinel).
+
+  uint8_t last_ack — (Used for swnd only) Sequence number of the most recent
+                     message that has been acknowledged by the remote receiver.
+                     The window is slid forward up to and including this sequence
+                     number when an ACK arrives.
+
+  uint8_t last_seq — (Used for swnd only) Sequence number that was assigned to
+                     the most recently sent new data message. Incremented (with
+                     wrap-around, skipping 0) each time a fresh packet is
+                     dispatched by Thread S.
+
+  time_t timestamp[BUF_SIZE]
+                   — Records the wall-clock time (seconds since epoch) at which
+                     the message at each buffer slot was last transmitted. Used
+                     by Thread S to detect timeout: if the difference between
+                     the current time and timestamp[j] exceeds T seconds, all
+                     unacknowledged messages in swnd are retransmitted. A value
+                     of -1 indicates the slot has not been sent yet.
+
+
+struct sockinfo
+---------------
+One entry in the shared memory array SM[]. Each active KTP socket occupies one
+slot; unused slots are marked with isfree = true.
+
+  int udpsockfd    — File descriptor of the underlying UDP socket that carries
+                     the actual bytes over the network. Initialised to -1; Thread
+                     R creates and binds the real UDP socket the first time it
+                     encounters a bound-but-not-yet-opened KTP socket.
+
+  int pid          — PID of the process that called k_socket() to create this
+                     KTP socket. Used by the garbage-collector thread (Thread G)
+                     to detect whether the owning process is still alive.
+
+  bool isfree      — True when this SM slot is available for a new k_socket()
+                     call; false when it is in use.
+
+  bool isbound     — Set to true by k_bind(). Until bound, Thread R and Thread S
+                     skip this socket, and k_sendto() rejects calls with errno
+                     ENOTBOUND.
+
+  struct sockaddr_in src
+                   — Local (source) IP address and port number supplied to
+                     k_bind(). Thread R uses this to call the real bind() on the
+                     UDP socket.
+
+  struct sockaddr_in dest
+                   — Remote (destination) IP address and port number supplied to
+                     k_bind(). Packets arriving from any other address are
+                     silently discarded by Thread R.
+
+  char send_buf[BUF_SIZE][MSG_SIZE + 1]
+                   — Circular sender-side message buffer. k_sendto() copies
+                     application data into the slot at swnd.end before advancing
+                     the index. Thread S reads from here when transmitting new
+                     or retransmitted packets.
+
+  char recv_buf[BUF_SIZE][MSG_SIZE + 1]
+                   — Circular receiver-side message buffer. Thread R writes
+                     incoming data payloads here; k_recvfrom() reads from
+                     rwnd.start and clears the slot after delivering the message
+                     to the application.
+
+  window swnd      — Sender window state (see struct window above).
+
+  window rwnd      — Receiver window state (see struct window above).
+
+  int nospace      — Acts as a counter/flag for receiver-buffer-full events.
+                     Set to 1 the first time Thread R receives a packet but finds
+                     rwnd.size == 0. While non-zero, Thread R periodically
+                     retransmits a duplicate ACK with the current (now non-zero)
+                     rwnd size so the sender can resume. The counter is
+                     incremented each time such a duplicate ACK is sent, creating
+                     a linearly increasing retry interval (nospace * T),
+                     and is reset to 0 once a new in-order DATA message is
+                     successfully stored.
+
+  uint8_t last_ack_sent
+                   — Sequence number of the last ACK that this receiver sent to
+                     its peer. Stored so Thread R can retransmit the same ACK
+                     (with an updated rwnd) when the nospace condition is
+                     resolved.
+
+  time_t last_ack_time
+                   — Wall-clock time of the most recent ACK sent by this receiver.
+                     Used together with nospace to compute when the next
+                     duplicate ACK probe should be sent.
+
+---------------------------------------------------------------------------
+2.2  Packet / Message Format  (defined implicitly in initksocket.c)
+---------------------------------------------------------------------------
+
+All packets exchanged over the UDP socket have a fixed 6-byte header:
+
+  Bytes 0-3  : Message type, either the ASCII string "DATA" or "ACK\0"
+               (MSG_TYPE = 4 bytes).
+  Byte  4    : Sequence number (uint8_t, range 1-255; 0 is a sentinel).
+  Byte  5    : Receiver window size (uint8_t), piggybacked on every packet so
+               the sender always knows the current free space at the receiver.
+
+DATA packets additionally carry MSG_SIZE (512) bytes of payload immediately
+after the header.  ACK packets carry no payload.
+
+
+===========================================================================
+SECTION 3: FUNCTIONS
+===========================================================================
+
+---------------------------------------------------------------------------
+3.1  ksocket.c  —  Library Functions
+---------------------------------------------------------------------------
+
+window init_window()
+  Allocates and returns a zero-initialised window struct. start, end, last_ack
+  and last_seq are set to 0; size is set to WINDOW_SIZE - 1 (i.e., BUF_SIZE - 1,
+  the maximum number of in-flight messages); every seq_num[] entry is set to 0
+  (empty sentinel) and every timestamp[] entry is set to -1 (not yet sent).
+
+int k_socket(int domain, int type, int protocol)
+  Validates that domain == AF_INET and type == SOCK_KTP. Scans SM[] for the
+  first free slot. When found, marks the slot as occupied (isfree = false),
+  records the calling process's PID, initialises both swnd and rwnd via
+  init_window(), and returns the slot index as the KTP socket descriptor.
+  Returns -1 with errno = ENOSPACE if all N slots are occupied, or if the
+  arguments are invalid. Note: the actual UDP socket is NOT created here; it is
+  deferred to Thread R (see threadR) so that the init process, not the user
+  process, owns the file descriptor.
+
+int k_bind(int sockfd, struct sockaddr *src, struct sockaddr *dest)
+  Records the source and destination sockaddr_in structures into SM[sockfd].src
+  and SM[sockfd].dest, and sets SM[sockfd].isbound = true. Acquires the
+  per-socket semaphore around the SM update. Returns 0 on success, -1 if sockfd
+  is out of range or the slot is free.
+
+ssize_t k_sendto(int sockfd, const void *buf, size_t len, int flags,
+                 const struct sockaddr *dest_addr, socklen_t addrlen)
+  Checks that the socket is bound and that dest_addr matches the bound
+  destination; otherwise returns -1 with errno = ENOTBOUND. Checks that the
+  sender circular buffer has a free slot (swnd.end + 1 != swnd.start); otherwise
+  returns -1 with errno = ENOSPACE. Copies up to MSG_SIZE bytes from buf into
+  send_buf[swnd.end] and advances swnd.end. Does NOT transmit the packet itself;
+  actual transmission is handled asynchronously by Thread S. Returns len on
+  success.
+
+ssize_t k_recvfrom(int sockfd, void *buf, size_t len, int flags,
+                   struct sockaddr *src_addr, socklen_t *addrlen)
+  Returns -1 with errno = ENOMESSAGE if rwnd.start == rwnd.end (no message ready).
+  Otherwise copies the message at recv_buf[rwnd.start] into buf, clears that
+  buffer slot, advances rwnd.start, and increments rwnd.size (one more free slot).
+  Returns the length of the received message string on success.
+
+int k_close(int fd)
+  Closes the underlying UDP socket (if open), marks SM[fd].isfree = true, resets
+  all window pointers and buffer contents to their initial state, and clears pid
+  and other bookkeeping fields. Acquires the per-socket semaphore during the
+  reset. Returns 0 on success, -1 if fd is invalid or already free.
+
+bool dropMessage(float p)
+  Simulates an unreliable link. Generates a pseudo-random float in [0, 1) and
+  returns true if it is less than p (i.e., the message is "dropped"), false
+  otherwise. Called by Thread R after every recvfrom() to decide whether to
+  silently discard the received packet.
+
+---------------------------------------------------------------------------
+3.2  initksocket.c  —  Init Process and Background Threads
+---------------------------------------------------------------------------
+
+int main()
+  Entry point for the initksocket process. Creates the shared memory segment
+  (keyed with ftok(".", 'H')) of size N * sizeof(sockinfo) and maps it to SM.
+  Initialises all N SM slots to isfree = true, udpsockfd = -1, pid = -1. Creates
+  a semaphore set (keyed with ftok(".", 'E')) of N semaphores, each initialised
+  to 1 (binary mutex, one per socket slot). Installs signal handlers for SIGINT
+  and SIGSEGV that call cleanup(). Spawns three POSIX threads: threadR, threadS,
+  and threadG, then calls pthread_exit() to let those threads run indefinitely.
+
+void cleanup(int signo)
+  Signal handler and error-exit routine. Removes the shared memory segment with
+  shmctl(IPC_RMID) and the semaphore set with semctl(IPC_RMID), prints a
+  diagnostic message, and calls exit(). Invoked on SIGINT, SIGSEGV, or a fatal
+  internal error (signo == -1).
+
+void build_packet(char *packet, const char *type, uint8_t seq,
+                  uint8_t rwnd, const char *msg)
+  Serialises a KTP packet into the byte buffer pointed to by packet. Writes the
+  4-byte type string, then seq (1 byte), then rwnd (1 byte). If type != "ACK",
+  also copies MSG_SIZE bytes of msg as the payload. The caller is responsible for
+  providing a buffer of at least KTP_HEADER_SIZE + MSG_SIZE bytes for DATA
+  packets, or KTP_HEADER_SIZE bytes for ACK packets.
+
+void parse_packet(const char *packet, char *type, uint8_t *seq,
+                  uint8_t *rwnd, char *msg)
+  Deserialises a raw byte buffer into its constituent fields: the 4-byte type
+  string (null-terminated by the function), the sequence number, the piggybacked
+  rwnd size, and (for DATA packets) the MSG_SIZE-byte payload. The inverse
+  operation of build_packet().
+
+uint8_t next_seq(int seq)
+  Increments seq by 1 with wrap-around in the range [1, 255]. When seq reaches
+  255 (i.e., uint8_t(-1)), the next value returned is 1, so that 0 is never
+  used as a live sequence number.
+
+void send_ack(int sockindex, uint8_t seq)
+  Builds a KTP_HEADER_SIZE-byte ACK packet for the given socket (piggybacking
+  SM[sockindex].rwnd.size as the receiver window size) and sends it via the
+  underlying UDP socket to SM[sockindex].dest. Used by Thread R after processing
+  an in-order data message.
+
+void retransmit_packet(int sockindex, int bufindex)
+  Re-sends the DATA packet already stored in send_buf[bufindex] for the given
+  socket. Reads the sequence number from swnd.seq_num[bufindex], rebuilds the
+  full packet with build_packet(), and transmits it via sendto(). Updates
+  swnd.timestamp[bufindex] to the current time so the next timeout measurement
+  starts from this retransmission.
+
+void send_new_packet(int sockindex, int bufindex)
+  Assigns the next sequence number (via next_seq(swnd.last_seq)), stores it in
+  swnd.seq_num[bufindex], builds and transmits the DATA packet from
+  send_buf[bufindex], and records the send timestamp. Called by Thread S when
+  there are buffered messages waiting to enter the network for the first time.
+
+void slide_sender_window(int sockindex, uint8_t ack_seq)
+  Advances swnd.start forward, freeing all slots whose sequence numbers fall at
+  or before ack_seq. Each freed slot has its seq_num reset to 0, its timestamp
+  reset to -1, and its send_buf entry zeroed. Updates swnd.last_ack to ack_seq.
+  Uses a wrap-safe comparison so window advancement works correctly across the
+  sequence number roll-over boundary.
+
+void *threadR()
+  Receiver thread; runs indefinitely.
+
+  Each iteration:
+  1. Builds an fd_set from all bound, non-free KTP socket UDP file descriptors.
+     If a bound socket does not yet have a UDP fd (udpsockfd == -1), Thread R
+     creates the underlying UDP socket and calls bind() on it at this point,
+     using the stored SM[i].src address.
+  2. Calls select() with a 1-second timeout.
+  3. On timeout (activity == 0): iterates over all active sockets and checks
+     whether the nospace flag is set and whether enough time has elapsed
+     (nospace * T seconds since last_ack_time). If so, re-sends an ACK carrying
+     the current (now non-zero) rwnd.size to the peer so the sender can resume.
+     The nospace counter is incremented each time to create a back-off effect,
+     handling the case where the duplicate ACK itself may also be dropped.
+  4. On activity: for each socket with data ready on its UDP fd, calls recvfrom()
+     and parse_packet() to extract the header fields. Calls dropMessage(P); if
+     it returns true the packet is silently discarded. Verifies the source address
+     matches SM[i].dest; mismatched packets are dropped.
+     - If type == "ACK": updates swnd.size to the piggybacked rwnd value.
+       If the ACK sequence number is within the current window (wrap-safe check),
+       calls slide_sender_window() to free acknowledged buffer slots.
+     - If type == "DATA": drops the packet if rwnd.size == 0 (buffer full, sets
+       nospace = 1). Checks whether the packet is a duplicate (already stored:
+       seq_num at the expected offset matches seq); if so, resends the last ACK
+       and discards. Drops the packet if its sequence number falls outside the
+       current receiver window. Otherwise stores the payload in recv_buf at the
+       correct circular-buffer offset. If the arrived packet is in-order (seq ==
+       next expected), slides rwnd.end forward through all consecutively
+       filled slots (to handle previously buffered out-of-order packets), then
+       calls send_ack() with the highest in-order sequence number so far.
+       Out-of-order packets that are within the window are buffered but do not
+       trigger an ACK.
+
+void *threadS()
+  Sender thread; runs indefinitely.
+
+  Each iteration:
+  1. Sleeps for T/2 seconds (half the retransmission timeout).
+  2. For each active, bound KTP socket:
+     a. Timeout check: scans swnd from start to end; if any slot has a non-zero
+        sequence number and its timestamp is more than T seconds in the past,
+        sets a timeout flag and breaks.
+     b. Retransmission: if the timeout flag is set, calls retransmit_packet()
+        for every occupied slot in swnd (i.e., performs a full window
+        retransmission).
+     c. New packet dispatch: scans swnd from start to end; for each slot that
+        has a non-empty send_buf entry but a timestamp of -1 (not yet sent),
+        calls send_new_packet() and decrements swnd.size. Stops if swnd.size
+        reaches 0 (no more capacity permitted by the receiver window).
+
+void *threadG()
+  Garbage-collector thread; runs indefinitely.
+
+  Sleeps for T seconds between sweeps. On each wake-up, iterates over all N SM
+  slots. For any non-free slot, sends signal 0 (kill(pid, 0)) to the owning
+  process to test whether it is still alive. If the process no longer exists
+  (errno == ESRCH), calls k_close() on that socket to release the SM slot and
+  close the underlying UDP socket, preventing resource leaks from crashed or
+  abruptly terminated user processes.
+
+===========================================================================
