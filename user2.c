@@ -92,7 +92,7 @@ int main(int argc, char *argv[]) {
         fwrite(buffer, 1, r, fp);
         fflush(fp);
         printf("Received %zu bytes\n", r);
-        sleep(1); // simulate processing time
+        // sleep(1); // simulate processing time
     }
 
     fclose(fp);

@@ -105,7 +105,7 @@ int main(int argc, char *argv[]) {
         }
         
         printf("Sent %zu bytes\n", bytes);
-        sleep(1); // simulate processing time
+        // sleep(1); // simulate processing time
 
         if(done) {
             printf("user1: EOF marker sent.\n");

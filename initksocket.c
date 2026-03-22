@@ -26,6 +26,8 @@ Member 2 Roll number: 23CS30024
 extern int semid, shmid;
 extern sockinfo* SM;
 
+int sent_cnt = 0;
+
 void build_packet(char *packet, const char *type, uint8_t seq, uint8_t rwnd, const char *msg) {
     memcpy(packet, type, MSG_TYPE);
     memcpy(packet + MSG_TYPE, &seq, sizeof(uint8_t));
@@ -56,6 +58,8 @@ void retransmit_packet(int sockindex, int bufindex) {
     build_packet(packet, "DATA", seq, SM[sockindex].rwnd.size, SM[sockindex].send_buf[bufindex]);
     sendto(SM[sockindex].udpsockfd, packet, sizeof(packet), 0, (struct sockaddr *)&SM[sockindex].dest, sizeof(SM[sockindex].dest));
     SM[sockindex].swnd.timestamp[bufindex] = time(NULL);
+    sent_cnt++;
+    printf("Total packets sent: %d\n", sent_cnt);
 }
 
 // returns next sequence number, handling wrap around
@@ -73,6 +77,8 @@ void send_new_packet(int sockindex, int bufindex) {
     build_packet(packet, "DATA", seq, SM[sockindex].rwnd.size, SM[sockindex].send_buf[bufindex]);
     sendto(SM[sockindex].udpsockfd, packet, sizeof(packet), 0, (struct sockaddr *)&SM[sockindex].dest, sizeof(SM[sockindex].dest));
     SM[sockindex].swnd.timestamp[bufindex] = time(NULL);
+    sent_cnt++;
+    printf("Total packets sent: %d\n", sent_cnt);
 }
 
 void slide_sender_window(int sockindex, uint8_t ack_seq) {
@@ -93,7 +99,7 @@ void *threadR() {
     printf("Receiver thread started\n");
 
     while (1) {
-        printf("Receiver thread awake, checking for incoming packets\n");
+        // printf("Receiver thread awake, checking for incoming packets\n");
         // Build fd set
         FD_ZERO(&readfds);
         int maxfd = -1;
@@ -272,7 +278,7 @@ void *threadS() {
     while (1) {
         // sleep for T / 2 seconds
         sleep(T / 2);
-        printf("Sender thread awake, checking for timeouts and new packets to send\n");
+        // printf("Sender thread awake, checking for timeouts and new packets to send\n");
         for (int i = 0; i < N; i++) {
             Wait(semid, i);
             if (SM[i].isfree || !SM[i].isbound) {
