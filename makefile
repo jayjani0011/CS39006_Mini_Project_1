@@ -14,7 +14,7 @@ INPUTFILE := sample_input.txt
 LIBNAME = libksocket.a
 OBJFILES = ksocket.o
 
-FOUR_USERS ?= 0
+MULTIPLE ?= 0
 
 
 library: $(OBJFILES)
@@ -41,7 +41,7 @@ runuser: user
 	gnome-terminal -- bash -c "./u1 $(IP) $(PORT1) $(IP) $(PORT2) $(INPUTFILE); exec bash"
 	gnome-terminal -- bash -c "./u2 $(IP) $(PORT2) $(IP) $(PORT1) received1.txt; exec bash"
 
-ifeq ($(FOUR_USERS), 1)
+ifeq ($(MULTIPLE), 1)
 	gnome-terminal -- bash -c "./u2 $(IP) $(PORT4) $(IP) $(PORT3) received2.txt; exec bash"
 	gnome-terminal -- bash -c "./u1 $(IP) $(PORT3) $(IP) $(PORT4) $(INPUTFILE); exec bash"
 endif

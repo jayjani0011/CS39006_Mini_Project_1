@@ -8,8 +8,8 @@ Shresth Jha - 23CS30024
 ## Run locally
 
 1. `make runinit` to start initksocket
-2. `make runuser` to start 2 user processes \
-    `make runuser FOUR_USERS=1` to start 4 user processes
+2. `make runuser` to start 2 user processes (1 sender-receiver pair) \
+    `make runuser MULTIPLE=1` to start 4 user processes (2 sender-receiver pairs)
 
 ## Run on different PCs
 
