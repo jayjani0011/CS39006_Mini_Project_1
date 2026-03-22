@@ -31,10 +31,10 @@ int k_socket(int domain, int type, int protocol) {
     }
 
     for (int i = 0; i < N; i++) {
-        printf("k_socket: Checking socket index %d, isfree = ", i);
-        fflush(stdout);
-        printf("%d\n", SM[i].isfree);
-        fflush(stdout);
+        // printf("k_socket: Checking socket index %d, isfree = ", i);
+        // fflush(stdout);
+        // printf("%d\n", SM[i].isfree);
+        // fflush(stdout);
         Wait(semid, i);
         if (SM[i].isfree) {
             // int fd = socket(AF_INET, SOCK_DGRAM, 0);
