@@ -333,4 +333,38 @@ void *threadG()
   close the underlying UDP socket, preventing resource leaks from crashed or
   abruptly terminated user processes.
 
+---------------------------------------------------------------------------
+3.3  user1.c and user2.c  —  Test Applications
+---------------------------------------------------------------------------
+
+user1.c  (Sender)
+  Accepts five command-line arguments: src_ip, src_port, dest_ip, dest_port,
+  and a filename. Attaches to the shared memory segment (same ftok key as the
+  init process) to gain access to SM. Creates a KTP socket via k_socket() and
+  binds it with k_bind() using the supplied address pair.
+
+  Opens the specified file in binary read mode and sends its contents in
+  MSG_SIZE-byte chunks using k_sendto(). If k_sendto() returns -1 with errno
+  ENOSPACE (sender window full), the application backs off for 1 second and
+  retries the same chunk — this busy-wait loop gives Thread S time to receive
+  ACKs and slide the window forward. Once the entire file has been sent, a
+  single-byte EOF marker ("~") is sent to signal the receiver that the
+  transfer is complete. After sending, the process sleeps for 100 seconds
+  before calling k_close(), keeping the SM slot alive long enough for Thread S
+  to flush and acknowledge any remaining in-flight packets.
+
+user2.c  (Receiver)
+  Accepts five command-line arguments: src_ip, src_port, dest_ip, dest_port,
+  and an output filename. Attaches to the shared memory segment, creates and
+  binds a KTP socket using the mirrored address pair (its source is user1's
+  destination and vice versa). Opens the output file in binary write mode.
+
+  Calls k_recvfrom() in a loop, writing each received chunk to the output
+  file with fwrite(). If k_recvfrom() returns -1 with errno ENOMESSAGE
+  (receive buffer empty), the application sleeps for 1 second and retries.
+  The loop terminates when the first byte of a received message matches the
+  EOF marker ("~"), at which point the file is closed and k_close() is called.
+  The output file is flushed after every write to ensure data is not lost if
+  the process is interrupted.
+
 ===========================================================================
