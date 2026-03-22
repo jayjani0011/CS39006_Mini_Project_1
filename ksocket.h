@@ -1,3 +1,14 @@
+/*
+=====================================
+Mini Project 1 Submission
+Group Details:
+Member 1 Name: Jay Jani
+Member 1 Roll number: 23CS10027
+Member 2 Name: Shresth Jha
+Member 2 Roll number: 23CS30024
+=====================================
+*/
+
 #pragma once
 
 #include <arpa/inet.h>
