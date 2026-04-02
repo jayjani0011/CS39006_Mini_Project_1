@@ -46,10 +46,11 @@ void parse_packet(const char *packet, char *type, uint8_t *seq, uint8_t *rwnd, c
     }
 }
 
-void send_ack(int sockindex, uint8_t seq) {
+void send_ack(int sockindex) {
     char packet[KTP_HEADER_SIZE];
-    build_packet(packet, "ACK\0", seq, SM[sockindex].rwnd.size, NULL);
+    build_packet(packet, "ACK\0", SM[sockindex].last_ack_sent, SM[sockindex].rwnd.size, NULL);
     sendto(SM[sockindex].udpsockfd, packet, KTP_HEADER_SIZE, 0, (struct sockaddr *)&SM[sockindex].dest, sizeof(SM[sockindex].dest));
+    SM[sockindex].last_ack_time = time(NULL);
 }
 
 void retransmit_packet(int sockindex, int bufindex) {
@@ -143,10 +144,8 @@ void *threadR() {
                 Wait(semid, i);
                 time_t now = time(NULL);
                 if (!SM[i].isfree && SM[i].isbound && SM[i].nospace && SM[i].rwnd.size > 0 && SM[i].last_ack_time != -1 && difftime(now, SM[i].last_ack_time) >= SM[i].nospace * T) {
-                    char packet[KTP_HEADER_SIZE];
-                    build_packet(packet, "ACK\0", SM[i].last_ack_sent, SM[i].rwnd.size, NULL);
-                    sendto(SM[i].udpsockfd, packet, KTP_HEADER_SIZE, 0, (struct sockaddr *)&SM[i].dest, sizeof(SM[i].dest));
-                    SM[i].last_ack_time = time(NULL);
+                    send_ack(i);
+                    printf("Sent duplicate ACK for seq %d for k_socket %d due to receiver buffer full condition, nospace = %d\n", SM[i].last_ack_sent, i, SM[i].nospace);
                     SM[i].nospace++; // this duplicate may get dropped as well (that problem written in assignment)
                     // hence, we need to keep sending ACK's with increasing timeout values, until we receive a message
                 }
@@ -217,25 +216,23 @@ void *threadR() {
 
                     uint8_t expected = next_seq(SM[i].last_ack_sent);
                     // check if packet is duplicate
-                    for (int k = W->start; k != W->end; k = (k + 1) % BUF_SIZE) {
-                        if (W->seq_num[k] == seq) {
-                            Signal(semid, i);
-                            continue;
-                        }
-                    }
+                    // for (int k = W->start; k != W->end; k = (k + 1) % BUF_SIZE) {
+                    //     if (W->seq_num[k] == seq) {
+                    //         Signal(semid, i);
+                    //         continue;
+                    //     }
+                    // } --- this was meaningless, in fact wrong because we are releasing the semaphore
 
                     // compute offset from expected seq (wrap safe)
                     uint8_t diff = (uint8_t)(seq - expected);
                     // if packet outside receiver window -> drop
                     // need to send duplicate ACK for duplicate packet
                     if (diff >= W->size - 1) {
-                        printf("Packet with seq %d outside receiver window, expected %d\n", seq, expected);
+                        printf("Packet with seq %d outside receiver window, expected %d\n", seq, expected); // this will ignore the duplicate packet
                         if ((uint8_t)(seq - SM[i].last_ack_sent) < WINDOW_SIZE) {
+                            // duplicate packet won't reach here
                             printf("Packet with seq %d is a new packet outside receiver window, sending ACK for last acknowledged seq %d\n", seq, SM[i].last_ack_sent);
-                            char packet[KTP_HEADER_SIZE];
-                            build_packet(packet, "ACK\0", SM[i].last_ack_sent, SM[i].rwnd.size, NULL);
-                            sendto(SM[i].udpsockfd, packet, KTP_HEADER_SIZE, 0, (struct sockaddr *)&SM[i].dest, sizeof(SM[i].dest));
-                            SM[i].last_ack_time = time(NULL);
+                            send_ack(i);
                         }
                         Signal(semid, i);
                         continue;
@@ -256,12 +253,11 @@ void *threadR() {
                             int idx = W->end;
                             SM[i].last_ack_sent = W->seq_num[idx];
                             printf("Sliding receiver window, ACKing seq %d for k_socket %d\n", SM[i].last_ack_sent, i);
-                            W->seq_num[idx] = 0; // will this create issue for duplicate ACK sending?
+                            W->seq_num[idx] = 0; // will this create issue for duplicate ACK sending? -- keep 0 as an invalid sequence no.
                             W->end = (W->end + 1) % BUF_SIZE;
                         }
 
-                        send_ack(i, SM[i].last_ack_sent);
-                        SM[i].last_ack_time = time(NULL);
+                        send_ack(i);
                         printf("Sent ACK for seq %d for k_socket %d\n", SM[i].last_ack_sent, i);
                     }
                     // out-of-order packets are stored but NOT ACKed
